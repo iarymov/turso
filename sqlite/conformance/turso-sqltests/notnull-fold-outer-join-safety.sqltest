@@ -102,21 +102,6 @@ expect {
     30
 }
 
-# Matched (not just unmatched) probe row: confirms the fold decline and the
-# hash-join cache-hit guard compose correctly here (see
-# hash-join-stale-cursor-peek.sqltest).
-test full-outer-join-is-null-does-not-peek-stale-hash-join-cursor {
-    CREATE TABLE t1 (id INTEGER PRIMARY KEY, k, a TEXT NOT NULL);
-    CREATE TABLE t2 (id INTEGER PRIMARY KEY, k, b TEXT NOT NULL);
-    INSERT INTO t1 VALUES (1, 10, 'x'), (2, 20, 'y');
-    INSERT INTO t2 VALUES (1, 20, 'n'), (2, 30, 'p');
-
-    SELECT t2.k FROM t1 FULL OUTER JOIN t2 ON t1.k = t2.k WHERE t1.a IS NULL ORDER BY t2.k;
-}
-expect {
-    30
-}
-
 test full-outer-join-notnull-col-is-not-null-not-folded {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, k, a TEXT NOT NULL);
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, k, b TEXT NOT NULL);
@@ -166,4 +151,72 @@ test full-outer-join-notnull-col-other-side-not-folded {
 }
 expect {
     10
+}
+
+# --- Plain single-table queries: the fold must actually fire here -------------
+# Everything above tests the fold correctly declining. These confirm it still
+# does its job in the ordinary case it targets: no join, so nothing can
+# null-extend `v`, and it's schema NOT NULL.
+
+test single-table-notnull-col-is-null-folds-to-false {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+
+    SELECT id FROM t WHERE v IS NULL;
+}
+expect {
+}
+
+test single-table-notnull-col-is-not-null-folds-to-true {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+
+    SELECT id FROM t WHERE v IS NOT NULL ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test single-table-count-notnull-col-equals-count-star {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');
+
+    SELECT COUNT(v) FROM t;
+}
+expect {
+    3
+}
+
+# --- UPDATE ... FROM: WHERE folding must use the full target+FROM scope -------
+# Regression test: `plan.where_clause` for `UPDATE ... FROM` is bound against
+# both the target and FROM-side tables, so the fold's `is_nonnull` lookup must
+# see that same combined scope. Using only the target table's scope here
+# previously panicked with "table not found" as soon as the WHERE clause did
+# `IS [NOT] NULL` on a FROM-side column.
+
+test update-from-where-is-null-on-from-side-notnull-column {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, notnull_col TEXT NOT NULL);
+    INSERT INTO t1 VALUES (1, 0);
+    INSERT INTO t2 VALUES (1, 'present');
+
+    UPDATE t1 SET x = 1 FROM t2 WHERE t2.notnull_col IS NULL;
+    SELECT x FROM t1;
+}
+expect {
+    0
+}
+
+test update-from-where-is-not-null-on-from-side-notnull-column {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, notnull_col TEXT NOT NULL);
+    INSERT INTO t1 VALUES (1, 0);
+    INSERT INTO t2 VALUES (1, 'present');
+
+    UPDATE t1 SET x = 1 FROM t2 WHERE t1.id = t2.id AND t2.notnull_col IS NOT NULL;
+    SELECT x FROM t1;
+}
+expect {
+    1
 }

@@ -823,26 +823,22 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         return None;
     }
 
+    // Shared by both COUNT shapes below: no join, no WHERE/LIMIT/OFFSET to filter or
+    // truncate the rows the O(1) btree count would report.
+    let is_unfiltered_btree_count = matches!(table_ref.table, Table::BTree(..))
+        && plan.table_references.outer_query_refs().is_empty()
+        && plan.where_clause.is_empty()
+        && plan.limit.is_none()
+        && plan.offset.is_none();
+
     match agg.func {
-        AggFunc::Count0
-            if matches!(table_ref.table, Table::BTree(..))
-                && plan.table_references.outer_query_refs().is_empty()
-                && plan.where_clause.is_empty()
-                && plan.limit.is_none()
-                && plan.offset.is_none() =>
-        {
-            Some(SimpleAggregate::Count)
-        }
+        AggFunc::Count0 if is_unfiltered_btree_count => Some(SimpleAggregate::Count),
         // COUNT(col) on a provably non-null col is equivalent to COUNT(*). The
         // join check above already rules out joins, so a bare `is_nonnull`
         // suffices here (no need for the join-aware `column_is_null_fold_safe`
         // used at the WHERE-clause site).
         AggFunc::Count
-            if matches!(table_ref.table, Table::BTree(..))
-                && plan.table_references.outer_query_refs().is_empty()
-                && plan.where_clause.is_empty()
-                && plan.limit.is_none()
-                && plan.offset.is_none()
+            if is_unfiltered_btree_count
                 && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
                 && agg.args.len() == 1
                 && matches!(agg.args[0], ast::Expr::Column { .. })
@@ -1255,10 +1251,13 @@ fn optimize_update_plan(
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);
     }
-    let mut target_tables = TableReferences::new(
-        vec![plan.target_table.clone()],
-        plan.from_tables.outer_query_refs().to_vec(),
-    );
+    // `plan.where_clause` is bound against target + FROM tables together (see
+    // `build_read_scope_tables`'s doc comment), so constant folding below must see that
+    // same combined scope -- not just the target table -- or a fold that looks up a
+    // FROM-side column (e.g. `Expr::is_nonnull`) won't find it in `target_tables` and
+    // panics. When there's no `FROM` (`is_update_from` false), `plan.from_tables` is
+    // empty and this is equivalent to the target-only scope used below.
+    let mut target_tables = plan.build_read_scope_tables();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;

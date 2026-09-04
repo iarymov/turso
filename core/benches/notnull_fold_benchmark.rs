@@ -53,9 +53,11 @@ fn open_conn(path: &std::path::Path) -> (Arc<Database>, Arc<turso_core::Connecti
     (db, conn)
 }
 
-/// All rows populated (never NULL) -- the point of this table is that `notnull_text`/
-/// `notnull_blob` carry a real `NOT NULL` schema constraint, making them eligible for
-/// the constant-fold.
+/// All rows populated (never NULL) -- the point of this table is that `notnull_text`
+/// carries a real `NOT NULL` schema constraint, making it eligible for the
+/// constant-fold. (Only one NOT NULL column is benchmarked: post-fold, the column's
+/// physical type is never read at runtime, so a second column of a different type
+/// would just double the matrix without adding signal.)
 fn seed_notnull_db(n: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("notnull_fold.db");
@@ -65,21 +67,19 @@ fn seed_notnull_db(n: usize) -> TempDir {
          CREATE TABLE t(
              id INTEGER PRIMARY KEY,
              g TEXT,
-             notnull_text TEXT NOT NULL,
-             notnull_blob BLOB NOT NULL
+             notnull_text TEXT NOT NULL
          );",
     )
     .unwrap();
     let tx = conn.unchecked_transaction().unwrap();
     {
         let mut ins = tx
-            .prepare("INSERT INTO t(id, g, notnull_text, notnull_blob) VALUES (?1, ?2, ?3, ?4)")
+            .prepare("INSERT INTO t(id, g, notnull_text) VALUES (?1, ?2, ?3)")
             .unwrap();
         for i in 1..=n as i64 {
             let g = format!("group-{:02}", i % 16);
             let text = format!("row-text-payload-{i}");
-            let blob = vec![(i % 251) as u8; 64];
-            ins.execute((i, &g, text, blob)).unwrap();
+            ins.execute((i, &g, text)).unwrap();
         }
     }
     tx.commit().unwrap();
@@ -87,26 +87,16 @@ fn seed_notnull_db(n: usize) -> TempDir {
 }
 
 const NOTNULL_QUERY_SHAPES: &[(&str, &str)] = &[
-    ("count_col", "SELECT COUNT({col}) FROM t"),
-    ("where_is_null", "SELECT id FROM t WHERE {col} IS NULL"),
+    ("count_col", "SELECT COUNT(notnull_text) FROM t"),
+    (
+        "where_is_null",
+        "SELECT id FROM t WHERE notnull_text IS NULL",
+    ),
     (
         "where_is_not_null",
-        "SELECT id FROM t WHERE {col} IS NOT NULL",
+        "SELECT id FROM t WHERE notnull_text IS NOT NULL",
     ),
 ];
-
-const NOTNULL_COLUMNS: &[&str] = &["notnull_text", "notnull_blob"];
-
-// Set BENCH_SCALE_SWEEP=1 to additionally run at 10K and 100M rows, on top of the
-// default 1M. Gated behind an env var so a plain `cargo bench` invocation stays at the
-// original single-scale runtime.
-fn notnull_fold_scales() -> Vec<usize> {
-    if std::env::var("BENCH_SCALE_SWEEP").as_deref() == Ok("1") {
-        vec![10_000, 1_000_000, 100_000_000]
-    } else {
-        vec![N]
-    }
-}
 
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_notnull_fold(criterion: &mut Criterion) {
@@ -115,21 +105,14 @@ fn bench_notnull_fold(criterion: &mut Criterion) {
     group.measurement_time(Duration::from_secs(8));
     group.warm_up_time(Duration::from_secs(2));
 
-    for n in notnull_fold_scales() {
-        let dir = seed_notnull_db(n);
-        let path = dir.path().join("notnull_fold.db");
-
-        for col in NOTNULL_COLUMNS {
-            let (db, conn) = open_conn(&path);
-            for (shape_label, sql_template) in NOTNULL_QUERY_SHAPES {
-                let sql = sql_template.replace("{col}", col);
-                let bench_id = format!("{shape_label}/{col}");
-                group.bench_with_input(BenchmarkId::new(bench_id, n), &n, |b, _| {
-                    let mut stmt = conn.prepare(&sql).unwrap();
-                    b.iter(|| drain_turso(&db, &mut stmt));
-                });
-            }
-        }
+    let dir = seed_notnull_db(N);
+    let path = dir.path().join("notnull_fold.db");
+    let (db, conn) = open_conn(&path);
+    for (shape_label, sql) in NOTNULL_QUERY_SHAPES {
+        group.bench_with_input(BenchmarkId::new(*shape_label, N), &N, |b, _| {
+            let mut stmt = conn.prepare(sql).unwrap();
+            b.iter(|| drain_turso(&db, &mut stmt));
+        });
     }
     group.finish();
 }
