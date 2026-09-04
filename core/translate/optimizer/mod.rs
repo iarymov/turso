@@ -833,6 +833,23 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         {
             Some(SimpleAggregate::Count)
         }
+        // COUNT(col) on a provably non-null col is equivalent to COUNT(*). The
+        // join check above already rules out joins, so a bare `is_nonnull`
+        // suffices here (no need for the join-aware `column_is_null_fold_safe`
+        // used at the WHERE-clause site).
+        AggFunc::Count
+            if matches!(table_ref.table, Table::BTree(..))
+                && plan.table_references.outer_query_refs().is_empty()
+                && plan.where_clause.is_empty()
+                && plan.limit.is_none()
+                && plan.offset.is_none()
+                && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
+                && agg.args.len() == 1
+                && matches!(agg.args[0], ast::Expr::Column { .. })
+                && agg.args[0].is_nonnull(&plan.table_references) =>
+        {
+            Some(SimpleAggregate::Count)
+        }
         AggFunc::Min | AggFunc::Max
             if agg.args.len() == 1
                 && matches!(
@@ -1050,7 +1067,7 @@ fn find_select_plan_form(
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, &plan.table_references)?
     {
         plan.contains_constant_false_condition = true;
         plan.estimated_output_rows = Some(0.0);
@@ -1198,7 +1215,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, &plan.table_references)?
     {
         plan.contains_constant_false_condition = true;
         return Ok(());
@@ -1246,7 +1263,7 @@ fn optimize_update_plan(
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
-        eliminate_constant_conditions(&mut plan.where_clause)?
+        eliminate_constant_conditions(&mut plan.where_clause, &target_tables)?
     {
         plan.contains_constant_false_condition = true;
         if is_update_from {
@@ -3281,15 +3298,16 @@ enum ConstantConditionEliminationResult {
 /// This is used to determine whether the query can be aborted early.
 fn eliminate_constant_conditions(
     where_clause: &mut [WhereTerm],
+    tables: &TableReferences,
 ) -> Result<ConstantConditionEliminationResult> {
     let mut i = 0;
     while i < where_clause.len() {
         let predicate = &where_clause[i];
-        if predicate.expr.is_always_true()? {
+        if predicate.expr.is_always_true(tables)? {
             // true predicates can be removed since they don't affect the result
             where_clause[i].consumed = true;
             i += 1;
-        } else if predicate.expr.is_always_false()? {
+        } else if predicate.expr.is_always_false(tables)? {
             // any false predicate in a list of conjuncts (AND-ed predicates) will make the whole list false,
             // except an outer join condition, because that just results in NULLs, not skipping the whole loop
             if predicate.from_outer_join.is_some() {
@@ -3357,6 +3375,20 @@ pub enum AlwaysTrueOrFalse {
     AlwaysFalse,
 }
 
+/// True when `expr` is a bare column reference that is provably non-null (rowid alias or a
+/// `NOT NULL` constraint) *and* whose table can never be null-extended by an outer/full join.
+/// The join check matters because a null-extended row makes an otherwise-non-null column read
+/// as SQL NULL at runtime, which `Expr::is_nonnull` can't see since it only reasons about the
+/// column's own table-local schema declaration.
+fn column_is_null_fold_safe(expr: &ast::Expr, tables: &TableReferences) -> bool {
+    match expr {
+        ast::Expr::Column { table, .. } => {
+            expr.is_nonnull(tables) && !tables.outer_join_may_null_extend(*table)
+        }
+        _ => false,
+    }
+}
+
 /**
   Helper trait for expressions that can be optimized
   Implemented for ast::Expr
@@ -3364,12 +3396,15 @@ pub enum AlwaysTrueOrFalse {
 pub trait Optimizable {
     // if the expression is a constant expression that, when evaluated as a condition, is always true or false
     // return a [ConstantPredicate].
-    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>>;
-    fn is_always_true(&self) -> Result<bool> {
-        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysTrue))
+    fn check_always_true_or_false(
+        &self,
+        tables: &TableReferences,
+    ) -> Result<Option<AlwaysTrueOrFalse>>;
+    fn is_always_true(&self, tables: &TableReferences) -> Result<bool> {
+        Ok(self.check_always_true_or_false(tables)? == Some(AlwaysTrueOrFalse::AlwaysTrue))
     }
-    fn is_always_false(&self) -> Result<bool> {
-        Ok(self.check_always_true_or_false()? == Some(AlwaysTrueOrFalse::AlwaysFalse))
+    fn is_always_false(&self, tables: &TableReferences) -> Result<bool> {
+        Ok(self.check_always_true_or_false(tables)? == Some(AlwaysTrueOrFalse::AlwaysFalse))
     }
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool;
     fn is_nonnull(&self, tables: &TableReferences) -> bool;
@@ -3568,8 +3603,31 @@ impl Optimizable for ast::Expr {
         }
     }
     /// Returns true if the expression is a constant expression that, when evaluated as a condition, is always true or false
-    fn check_always_true_or_false(&self) -> Result<Option<AlwaysTrueOrFalse>> {
+    fn check_always_true_or_false(
+        &self,
+        tables: &TableReferences,
+    ) -> Result<Option<AlwaysTrueOrFalse>> {
         match self {
+            // `col IS [NOT] NULL` folds to a constant when `col` is provably non-null
+            // (see `column_is_null_fold_safe`).
+            Self::Binary(lhs, ast::Operator::Is, rhs)
+                if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                    && column_is_null_fold_safe(lhs, tables) =>
+            {
+                Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
+            }
+            Self::Binary(lhs, ast::Operator::IsNot, rhs)
+                if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null))
+                    && column_is_null_fold_safe(lhs, tables) =>
+            {
+                Ok(Some(AlwaysTrueOrFalse::AlwaysTrue))
+            }
+            Self::IsNull(expr) if column_is_null_fold_safe(expr, tables) => {
+                Ok(Some(AlwaysTrueOrFalse::AlwaysFalse))
+            }
+            Self::NotNull(expr) if column_is_null_fold_safe(expr, tables) => {
+                Ok(Some(AlwaysTrueOrFalse::AlwaysTrue))
+            }
             Self::Literal(lit) => match lit {
                 ast::Literal::Numeric(b) => {
                     if let Ok(int_value) = b.parse::<i64>() {
@@ -3603,7 +3661,7 @@ impl Optimizable for ast::Expr {
             },
             Self::Unary(op, expr) => {
                 if *op == ast::UnaryOperator::Not {
-                    let trivial = expr.check_always_true_or_false()?;
+                    let trivial = expr.check_always_true_or_false(tables)?;
                     return Ok(trivial.map(|t| match t {
                         AlwaysTrueOrFalse::AlwaysTrue => AlwaysTrueOrFalse::AlwaysFalse,
                         AlwaysTrueOrFalse::AlwaysFalse => AlwaysTrueOrFalse::AlwaysTrue,
@@ -3611,7 +3669,7 @@ impl Optimizable for ast::Expr {
                 }
 
                 if *op == ast::UnaryOperator::Negative {
-                    let trivial = expr.check_always_true_or_false()?;
+                    let trivial = expr.check_always_true_or_false(tables)?;
                     return Ok(trivial);
                 }
 
@@ -3629,8 +3687,8 @@ impl Optimizable for ast::Expr {
                 Ok(None)
             }
             Self::Binary(lhs, op, rhs) => {
-                let lhs_trivial = lhs.check_always_true_or_false()?;
-                let rhs_trivial = rhs.check_always_true_or_false()?;
+                let lhs_trivial = lhs.check_always_true_or_false(tables)?;
+                let rhs_trivial = rhs.check_always_true_or_false(tables)?;
                 match op {
                     ast::Operator::And => {
                         if lhs_trivial == Some(AlwaysTrueOrFalse::AlwaysFalse)
