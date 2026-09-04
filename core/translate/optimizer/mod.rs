@@ -823,8 +823,6 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         return None;
     }
 
-    // Shared by both COUNT shapes below: no join, no WHERE/LIMIT/OFFSET to filter or
-    // truncate the rows the O(1) btree count would report.
     let is_unfiltered_btree_count = matches!(table_ref.table, Table::BTree(..))
         && plan.table_references.outer_query_refs().is_empty()
         && plan.where_clause.is_empty()
@@ -833,10 +831,6 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
 
     match agg.func {
         AggFunc::Count0 if is_unfiltered_btree_count => Some(SimpleAggregate::Count),
-        // COUNT(col) on a provably non-null col is equivalent to COUNT(*). The
-        // join check above already rules out joins, so a bare `is_nonnull`
-        // suffices here (no need for the join-aware `column_is_null_fold_safe`
-        // used at the WHERE-clause site).
         AggFunc::Count
             if is_unfiltered_btree_count
                 && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
@@ -1251,12 +1245,6 @@ fn optimize_update_plan(
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);
     }
-    // `plan.where_clause` is bound against target + FROM tables together (see
-    // `build_read_scope_tables`'s doc comment), so constant folding below must see that
-    // same combined scope -- not just the target table -- or a fold that looks up a
-    // FROM-side column (e.g. `Expr::is_nonnull`) won't find it in `target_tables` and
-    // panics. When there's no `FROM` (`is_update_from` false), `plan.from_tables` is
-    // empty and this is equivalent to the target-only scope used below.
     let mut target_tables = plan.build_read_scope_tables();
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
@@ -3374,11 +3362,6 @@ pub enum AlwaysTrueOrFalse {
     AlwaysFalse,
 }
 
-/// True when `expr` is a bare column reference that is provably non-null (rowid alias or a
-/// `NOT NULL` constraint) *and* whose table can never be null-extended by an outer/full join.
-/// The join check matters because a null-extended row makes an otherwise-non-null column read
-/// as SQL NULL at runtime, which `Expr::is_nonnull` can't see since it only reasons about the
-/// column's own table-local schema declaration.
 fn column_is_null_fold_safe(expr: &ast::Expr, tables: &TableReferences) -> bool {
     match expr {
         ast::Expr::Column { table, .. } => {
@@ -3607,8 +3590,6 @@ impl Optimizable for ast::Expr {
         tables: &TableReferences,
     ) -> Result<Option<AlwaysTrueOrFalse>> {
         match self {
-            // `col IS [NOT] NULL` folds to a constant when `col` is provably non-null
-            // (see `column_is_null_fold_safe`).
             Self::Binary(lhs, ast::Operator::Is, rhs)
                 if matches!(rhs.as_ref(), ast::Expr::Literal(ast::Literal::Null))
                     && column_is_null_fold_safe(lhs, tables) =>

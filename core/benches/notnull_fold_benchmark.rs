@@ -1,10 +1,3 @@
-//! Microbenchmark for the NOT-NULL constant-fold optimization (tursodatabase/turso#4921):
-//! constant-folds `col IS [NOT] NULL` / `COUNT(col)` at plan time when `col` is provably
-//! non-null. `COUNT` reuses the O(1) btree-count fast path; `IS NULL` folds to an
-//! impossible condition; `IS NOT NULL` folds to an unconditional scan.
-//!
-//! Run:  cargo bench -p turso_core --bench notnull_fold_benchmark
-
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion,
@@ -53,11 +46,6 @@ fn open_conn(path: &std::path::Path) -> (Arc<Database>, Arc<turso_core::Connecti
     (db, conn)
 }
 
-/// All rows populated (never NULL) -- the point of this table is that `notnull_text`
-/// carries a real `NOT NULL` schema constraint, making it eligible for the
-/// constant-fold. (Only one NOT NULL column is benchmarked: post-fold, the column's
-/// physical type is never read at runtime, so a second column of a different type
-/// would just double the matrix without adding signal.)
 fn seed_notnull_db(n: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("notnull_fold.db");

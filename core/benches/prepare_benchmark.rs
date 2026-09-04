@@ -674,12 +674,6 @@ fn corpus_tpcds(bencher: Bencher, q: &str) {
     bench_corpus_query(bencher, TPCDS_SCHEMA, corpus_sql(TPCDS_QUERIES, q));
 }
 
-// NOT-NULL constant-fold guard overhead (tursodatabase/turso#4921): the fold itself is
-// benchmarked in notnull_fold_benchmark.rs. These measure the non-firing path -- every
-// ordinary query now runs through the widened is_nonnull/outer_join_may_null_extend guard
-// on its way to NOT folding. `age` hits the cheap single-table reject; the LEFT JOIN cases
-// exercise the full join-aware guard on a NOT NULL column that still declines to fold.
-
 #[turso_macros::divan_bench]
 fn notnull_fold_guard_where_is_null_nullable_column(bencher: Bencher) {
     bench_prepare(bencher, "SELECT id FROM users WHERE age IS NULL");

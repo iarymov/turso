@@ -1,16 +1,7 @@
 @database :memory:
 
-# Regression coverage for `column_is_null_fold_safe` (tursodatabase/turso#4921):
-# the NOT-NULL constant-fold must never fire on a column that an outer join
-# can null-extend, even though the column's own schema says NOT NULL.
-#
-# The FULL OUTER JOIN cases also exercise the peek opcodes' hash-join
-# cache-hit guard once the fold declines -- see hash-join-stale-cursor-peek.sqltest
-# for that guard's dedicated, fold-independent test.
-
-# --- LEFT JOIN: NOT NULL constraint on an outer-joined column ------------------
-# `e.v` is NOT NULL, but the LEFT JOIN can still null-extend the whole row when
-# there's no matching `p` row -- the constant-fold must not fire here.
+# Regression coverage for tursodatabase/turso#4921: the NOT NULL constant fold
+# must not fire on a column an outer join can null extend.
 
 test left-join-notnull-col-is-null-not-folded {
     CREATE TABLE p (id INTEGER PRIMARY KEY, n);
@@ -48,11 +39,6 @@ expect {
     1
 }
 
-# --- Self-join: same NOT NULL column, one side outer-joined -------------------
-# Both sides reference the same table/column; only the outer-joined occurrence
-# may be null-extended, so the fold must be decided per join-side, not per
-# column identity alone.
-
 test self-join-notnull-col-outer-side-not-folded {
     CREATE TABLE t (id INTEGER PRIMARY KEY, grp, v TEXT NOT NULL);
     INSERT INTO t VALUES (1, 'a', 'x'), (2, 'b', 'y');
@@ -73,8 +59,6 @@ test self-join-notnull-col-inner-side-still-folds-to-empty {
 expect {
 }
 
-# --- CTE: NOT NULL column exposed through a derived table, outer-joined -------
-
 test cte-notnull-col-outer-joined-not-folded {
     CREATE TABLE base (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
     INSERT INTO base VALUES (1, 'x');
@@ -87,8 +71,6 @@ test cte-notnull-col-outer-joined-not-folded {
 expect {
     p2
 }
-
-# --- FULL OUTER JOIN: NOT NULL constant-fold must not fire ---------------------
 
 test full-outer-join-notnull-col-is-null-not-folded {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, k, a TEXT NOT NULL);
@@ -139,8 +121,6 @@ expect {
     1
 }
 
-# `t2.b` is on the probe side here (t1 is build) -- confirms the guard is
-# symmetric for the other table's NOT NULL column.
 test full-outer-join-notnull-col-other-side-not-folded {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, k, a TEXT NOT NULL);
     CREATE TABLE t2 (id INTEGER PRIMARY KEY, k, b TEXT NOT NULL);
@@ -152,11 +132,6 @@ test full-outer-join-notnull-col-other-side-not-folded {
 expect {
     10
 }
-
-# --- Plain single-table queries: the fold must actually fire here -------------
-# Everything above tests the fold correctly declining. These confirm it still
-# does its job in the ordinary case it targets: no join, so nothing can
-# null-extend `v`, and it's schema NOT NULL.
 
 test single-table-notnull-col-is-null-folds-to-false {
     CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);
@@ -187,13 +162,6 @@ test single-table-count-notnull-col-equals-count-star {
 expect {
     3
 }
-
-# --- UPDATE ... FROM: WHERE folding must use the full target+FROM scope -------
-# Regression test: `plan.where_clause` for `UPDATE ... FROM` is bound against
-# both the target and FROM-side tables, so the fold's `is_nonnull` lookup must
-# see that same combined scope. Using only the target table's scope here
-# previously panicked with "table not found" as soon as the WHERE clause did
-# `IS [NOT] NULL` on a FROM-side column.
 
 test update-from-where-is-null-on-from-side-notnull-column {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, x INTEGER);
