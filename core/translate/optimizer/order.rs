@@ -401,7 +401,7 @@ pub fn plan_satisfies_order_target(
                         &order_target.columns[target_col_idx..],
                         schema,
                     ),
-                    includes_rowid: false,
+                    unique_prefix: false,
                 }
             }
             _ => return false,
@@ -453,9 +453,9 @@ fn access_method_emits_unique_order_prefix(
     access_method: &AccessMethod,
     order_consumption: &OrderConsumption,
 ) -> bool {
-    // Rows always differ in rowid, so a consumed prefix that includes the
-    // rowid never repeats.
-    if order_consumption.includes_rowid {
+    // Rows always differ in rowid, and in the key of a unique index whose
+    // columns are all consumed.
+    if order_consumption.unique_prefix {
         return true;
     }
     // A complete lookup on a UNIQUE index also returns at most one row.
@@ -842,18 +842,35 @@ fn target_matches_order_column(
 pub(super) struct OrderConsumption {
     /// How many leading order-target columns the access path satisfies.
     pub consumed: usize,
-    /// Whether one of those consumed columns is the table's rowid (directly,
+    /// Whether the consumed columns never repeat across the rows this loop
+    /// emits. That holds when one of them is the table's rowid (directly,
     /// through a rowid alias, or through the implicit rowid suffix of a
-    /// secondary index). Every row has a different rowid, so a consumed prefix
-    /// that includes the rowid never repeats across the rows this loop emits.
-    pub includes_rowid: bool,
+    /// secondary index), or when they and the columns fixed by = make up a
+    /// whole unique index whose other columns are NOT NULL.
+    pub unique_prefix: bool,
 }
 
 impl OrderConsumption {
     pub const NONE: OrderConsumption = OrderConsumption {
         consumed: 0,
-        includes_rowid: false,
+        unique_prefix: false,
     };
+
+    /// True when the whole target is satisfied: all of it is consumed, or the
+    /// consumed part never repeats and the rest comes from the same table.
+    pub fn satisfies(
+        &self,
+        target: &OrderTarget,
+        table_id: TableInternalId,
+        allow_unique_prefix: impl FnOnce() -> bool,
+    ) -> bool {
+        self.consumed == target.columns.len()
+            || (self.unique_prefix
+                && target.columns[self.consumed..]
+                    .iter()
+                    .all(|column| column.table_id == table_id)
+                && allow_unique_prefix())
+    }
 }
 
 /// Return how many leading `order_target` columns this single-table btree
@@ -908,7 +925,7 @@ pub(super) fn btree_access_order_consumed(
             };
             OrderConsumption {
                 consumed: usize::from(correct_order),
-                includes_rowid: correct_order,
+                unique_prefix: correct_order,
             }
         }
         Some(index) => index_columns_order_consumed(
@@ -928,6 +945,7 @@ pub(super) fn btree_access_order_consumed(
             index.columns.len(),
             index.has_rowid,
             rowid_alias_col,
+            index.unique,
         ),
     }
 }
@@ -989,6 +1007,7 @@ fn temporary_index_order_consumed(
         column_count,
         table_ref.table.btree().is_some_and(|table| table.has_rowid),
         rowid_alias_col,
+        false,
     )
 }
 
@@ -1005,11 +1024,13 @@ fn index_columns_order_consumed<'a>(
     column_count: usize,
     has_rowid: bool,
     rowid_alias_col: Option<usize>,
+    unique_key: bool,
 ) -> OrderConsumption {
     let mut col_idx = 0;
     let mut matched_columns = 0;
+    let mut key_is_unique = unique_key;
     let mut index_columns = index_columns.enumerate();
-    let mut includes_rowid = false;
+    let mut unique_prefix = false;
     let target_is_rowid = |target_col: &ColumnOrder| match target_col.target {
         ColumnTarget::RowId => true,
         ColumnTarget::Column(col_no) => rowid_alias_col == Some(col_no),
@@ -1027,6 +1048,12 @@ fn index_columns_order_consumed<'a>(
             .iter()
             .any(|constraint| constraint.index_col_pos == idx_pos && constraint.eq.is_some());
         if eq_prefix_usable {
+            if constraint_refs.iter().any(|constraint| {
+                constraint.index_col_pos == idx_pos
+                    && constraint.eq.as_ref().is_some_and(|eq| eq.null_matching)
+            }) {
+                key_is_unique = false;
+            }
             if target_matches_order_column(target_col, idx_col, table_ref) {
                 if target_col.collation != idx_col.collation {
                     break;
@@ -1067,10 +1094,16 @@ fn index_columns_order_consumed<'a>(
             break;
         }
         if target_is_rowid(target_col) {
-            includes_rowid = true;
+            unique_prefix = true;
+        }
+        if target_can_be_null(target_col, table_ref) {
+            key_is_unique = false;
         }
         col_idx += 1;
         matched_columns += 1;
+    }
+    if key_is_unique && matched_columns == column_count {
+        unique_prefix = true;
     }
 
     // Rowid tables keep equal secondary-index keys ordered by rowid.
@@ -1086,13 +1119,13 @@ fn index_columns_order_consumed<'a>(
             && correct_order
         {
             col_idx += 1;
-            includes_rowid = true;
+            unique_prefix = true;
         }
     }
 
     OrderConsumption {
         consumed: col_idx,
-        includes_rowid,
+        unique_prefix,
     }
 }
 

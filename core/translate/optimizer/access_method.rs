@@ -201,6 +201,30 @@ pub(super) enum BranchReadMode {
     FullRow,
 }
 
+/// The unique-key rule saves the sort, but it makes the index scan read the
+/// table row by row in index order, which the cost model underestimates.
+/// So the sort is only counted as saved when the table is not read for the
+/// ORDER BY terms that the rule drops.
+fn unique_key_order_needs_no_lookup(
+    table: &JoinedTable,
+    index: Option<&Index>,
+    order_target: &OrderTarget,
+    consumed: usize,
+) -> bool {
+    let Some(index) = index else {
+        return true;
+    };
+    table.index_covers_columns_except(
+        index,
+        order_target.columns[consumed..]
+            .iter()
+            .filter_map(|column| match column.target {
+                ColumnTarget::Column(column_pos) => Some(column_pos),
+                _ => None,
+            }),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Choose the best ordinary btree lookup candidate for one table under the
 /// current join-order prefix.
@@ -306,28 +330,37 @@ pub(super) fn choose_best_btree_candidate(
                 // validation. Candidate scoring only needs to know whether
                 // this specific access path can emit rows ordered after its seek
                 // key.
-                let all_same_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Forwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                )
-                .consumed
-                    == order_target.columns.len();
-                let all_opposite_direction = btree_access_order_consumed(
-                    rhs_table,
-                    IterationDirection::Backwards,
-                    candidate.index.as_deref(),
-                    &usable_constraint_refs,
-                    order_target,
-                    0,
-                    schema,
-                )
-                .consumed
-                    == order_target.columns.len();
+                let consumption = |iter_dir| {
+                    btree_access_order_consumed(
+                        rhs_table,
+                        iter_dir,
+                        candidate.index.as_deref(),
+                        &usable_constraint_refs,
+                        order_target,
+                        0,
+                        schema,
+                    )
+                };
+                let forwards = consumption(IterationDirection::Forwards);
+                let backwards = consumption(IterationDirection::Backwards);
+                let all_same_direction =
+                    forwards.satisfies(order_target, rhs_table.internal_id, || {
+                        unique_key_order_needs_no_lookup(
+                            rhs_table,
+                            candidate.index.as_deref(),
+                            order_target,
+                            forwards.consumed,
+                        )
+                    });
+                let all_opposite_direction =
+                    backwards.satisfies(order_target, rhs_table.internal_id, || {
+                        unique_key_order_needs_no_lookup(
+                            rhs_table,
+                            candidate.index.as_deref(),
+                            order_target,
+                            backwards.consumed,
+                        )
+                    });
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
                 if satisfies_order {

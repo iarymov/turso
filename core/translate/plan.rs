@@ -3970,6 +3970,36 @@ impl JoinedTable {
         }
     }
 
+    /// Like [Self::index_is_covering], but ignores uses of the columns in
+    /// `ignored`, one use for each entry. Those uses are ORDER BY terms that
+    /// the index order makes unnecessary, so the table is not read for them.
+    pub fn index_covers_columns_except(
+        &self,
+        index: &Index,
+        ignored: impl Iterator<Item = usize> + Clone,
+    ) -> bool {
+        let Table::BTree(btree) = &self.table else {
+            return false;
+        };
+        let rowid_alias_pos = if btree.has_rowid {
+            btree.get_rowid_alias_column().map(|(pos, _)| pos)
+        } else {
+            None
+        };
+        self.col_used_mask.iter().all(|column| {
+            let uses = self.column_use_counts.get(column).copied().unwrap_or(0);
+            let ignored_uses = ignored.clone().filter(|ignored| *ignored == column).count();
+            rowid_alias_pos == Some(column)
+                || uses <= ignored_uses
+                || Self::index_provides_column(index, btree, column)
+        })
+    }
+
+    fn index_provides_column(index: &Index, btree: &BTreeTable, column: usize) -> bool {
+        index.column_table_pos_to_index_pos(column).is_some()
+            && !btree.columns()[column].is_virtual_generated()
+    }
+
     fn index_covers_columns(
         index: &Index,
         btree: &BTreeTable,
@@ -3996,13 +4026,7 @@ impl JoinedTable {
                 // rowid is always implicitly covered by the index
                 continue;
             }
-            let covered_by_index = index.column_table_pos_to_index_pos(required_col).is_some()
-                && !btree
-                    .columns()
-                    .get(required_col)
-                    .expect("column should be in table")
-                    .is_virtual_generated();
-            if !covered_by_index {
+            if !Self::index_provides_column(index, btree, required_col) {
                 return false;
             }
         }

@@ -1,0 +1,43 @@
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL UNIQUE, b INTEGER, c TEXT);
+    CREATE TABLE m (id INTEGER PRIMARY KEY, p INTEGER NOT NULL, q INTEGER NOT NULL, c TEXT, UNIQUE (p, q));
+    CREATE TABLE e (id INTEGER PRIMARY KEY, u INTEGER, q INTEGER NOT NULL, c TEXT, UNIQUE (u, q));
+}
+
+@setup schema
+snapshot order-by-unique-column {
+    SELECT a FROM t ORDER BY a, c;
+}
+
+@setup schema
+snapshot order-by-unique-column-desc {
+    SELECT a FROM t ORDER BY a DESC, c;
+}
+
+@setup schema
+snapshot order-by-multi-column-unique-key {
+    SELECT p, q FROM m ORDER BY p, q, c;
+}
+
+@setup schema
+snapshot order-by-unique-key-after-equality-on-nullable-column {
+    SELECT q FROM e WHERE u = 1 ORDER BY q, c;
+}
+
+@setup schema
+snapshot group-by-unique-column {
+    SELECT a, count(*) FROM t GROUP BY a, c;
+}
+
+@setup schema
+snapshot order-by-unique-column-keeps-sort-when-table-is-read {
+    SELECT a, c FROM t ORDER BY a, c;
+}
+
+@setup schema
+snapshot order-by-unique-column-with-rowid {
+    SELECT id, a FROM t ORDER BY a, c;
+}

@@ -1,0 +1,35 @@
+@database :memory:
+
+@cross-check-integrity
+test order-by-keeps-sort-for-nullable-unique-column {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, c TEXT);
+    INSERT INTO t VALUES (1,NULL,'b'), (2,NULL,'a'), (3,5,'z');
+    SELECT id FROM t ORDER BY u, c;
+}
+expect {
+    2
+    1
+    3
+}
+
+@cross-check-integrity
+test order-by-keeps-sort-for-part-of-unique-key {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, p INTEGER NOT NULL, q INTEGER NOT NULL, c TEXT, UNIQUE (p, q));
+    INSERT INTO t VALUES (1,1,1,'b'), (2,1,2,'a');
+    SELECT id FROM t ORDER BY p, c;
+}
+expect {
+    2
+    1
+}
+
+@cross-check-integrity
+test order-by-keeps-sort-for-is-null-on-unique-key {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER, q INTEGER NOT NULL, c TEXT, UNIQUE (u, q));
+    INSERT INTO t VALUES (1,NULL,1,'b'), (2,NULL,1,'a');
+    SELECT c FROM t WHERE u IS NULL ORDER BY q, c;
+}
+expect {
+    a
+    b
+}
